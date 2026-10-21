@@ -26,18 +26,39 @@ Item {
         }
     }
 
+    // Local patch: some SignalRGB builds (2.5.77+) hand QML a native function stub instead
+    // of a real value. String(stub) is "function() { [native code] }", which is neither a
+    // valid status nor valid JSON. Detect it and ignore it instead of polluting the UI.
+    property string lastDiagMessage: ""
+
+    function isFunctionStub(text) {
+        return String(text).indexOf("function") === 0 && String(text).indexOf("[native code]") >= 0
+    }
+
+    function logDiag(message) {
+        if (message === lastDiagMessage) {
+            return
+        }
+        lastDiagMessage = message
+        logUi("[patch] " + message)
+    }
+
     function updateDeviceModels(json) {
         json = String(json || "[]")
         if (json === deviceCatalogJson) {
-            return
+            return true
+        }
+        if (isFunctionStub(json) || json.charAt(0) !== "[") {
+            logDiag("device catalogue is not a JSON array, ignored: " + json.substring(0, 80))
+            return false
         }
 
         var devices = []
         try {
             devices = JSON.parse(json)
         } catch (e) {
-            logUi("Failed to parse OpenRGB Bridge device catalogue: " + String(e))
-            return
+            logDiag("Failed to parse OpenRGB Bridge device catalogue: " + String(e) + " | " + json.substring(0, 80))
+            return false
         }
 
         activeDeviceModel.clear()
@@ -68,6 +89,16 @@ Item {
         deviceCatalogJson = json
         activeCount = activeDeviceModel.count
         deletedCount = deletedDeviceModel.count
+        return true
+    }
+
+    function acceptStatus(text) {
+        text = String(text || "")
+        if (text === "" || isFunctionStub(text)) {
+            return false
+        }
+        statusText = text
+        return true
     }
 
     // Poll a cache-busted, atomic state snapshot. The stable status carrier below is
@@ -77,32 +108,41 @@ Item {
         // SignalRGB can cache return values from discovery methods across the QML/JS
         // bridge. The service setting is an atomic, thread-safe state bus updated by
         // TCP callbacks without mutating SignalRGB's controller model.
+        // Path 1: state persisted by the service in SignalRGB's settings store.
+        var raw1 = ""
         try {
-            var persistedState = JSON.parse(String(service.getSetting("General", "UiState") || "{}"))
-            if (Number(persistedState.revision || 0) > 0) {
-                if (String(persistedState.status || "") !== "") {
-                    statusText = String(persistedState.status)
+            raw1 = String(service.getSetting("General", "UiState") || "")
+            if (raw1 !== "" && !isFunctionStub(raw1)) {
+                var persistedState = JSON.parse(raw1)
+                if (Number(persistedState.revision || 0) > 0 &&
+                        updateDeviceModels(String(persistedState.devicesJson || "[]"))) {
+                    acceptStatus(persistedState.status)
+                    busy = !!persistedState.busy
+                    return
                 }
-                updateDeviceModels(String(persistedState.devicesJson || "[]"))
-                busy = !!persistedState.busy
-                return
             }
         } catch (e) {
         }
 
+        // Path 2: live state straight from the discovery service.
+        var raw2 = ""
         try {
-            var liveState = JSON.parse(String(discovery.getUiState(pollRevision) || "{}"))
-            if (String(liveState.pollToken || "") === String(pollRevision)) {
-                if (String(liveState.status || "") !== "") {
-                    statusText = String(liveState.status)
+            raw2 = String(discovery.getUiState(pollRevision) || "")
+            if (raw2 !== "" && !isFunctionStub(raw2)) {
+                var liveState = JSON.parse(raw2)
+                // The poll token is only there to defeat result caching; accept a
+                // non-matching token too rather than showing nothing at all.
+                if (updateDeviceModels(String(liveState.devicesJson || "[]"))) {
+                    acceptStatus(liveState.status)
+                    busy = !!liveState.busy
+                    return
                 }
-                updateDeviceModels(String(liveState.devicesJson || "[]"))
-                busy = !!liveState.busy
-                return
             }
         } catch (e) {
         }
 
+        // Path 3: legacy status-carrier controller. Match it strictly by id: on some
+        // builds every controller object answers truthy (function stubs) to any property.
         var foundStatus = ""
         var foundDeviceCatalog = ""
         var haveStatusBus = false
@@ -114,7 +154,7 @@ Item {
                 if (!obj) {
                     continue
                 }
-                if (String(obj.id || "") === statusControllerId || obj.bridgeStatusBus) {
+                if (String(obj.id || "") === statusControllerId) {
                     haveStatusBus = true
                     foundStatus = String(obj.bridgeStatus || "")
                     foundDeviceCatalog = String(obj.bridgeDevicesJson || "[]")
@@ -125,11 +165,12 @@ Item {
             busy = readBusy()
             return
         }
-        if (foundStatus !== "") {
-            statusText = foundStatus
-        }
+        acceptStatus(foundStatus)
         if (haveStatusBus) {
             updateDeviceModels(foundDeviceCatalog)
+        } else {
+            logDiag("no state received. UiState setting: '" + raw1.substring(0, 60) +
+                    "' | getUiState: '" + raw2.substring(0, 60) + "'")
         }
         busy = haveStatusBus ? statusBusBusy : readBusy()
     }
